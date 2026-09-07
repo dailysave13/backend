@@ -104,12 +104,45 @@ def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_purchases_user
                 ON purchases (user_id);
+
+            CREATE TABLE IF NOT EXISTS community_items (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                name           TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                category       TEXT NOT NULL DEFAULT 'Other',
+                reference_price REAL,
+                created_at     TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS community_posts (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                zip_code       TEXT NOT NULL,
+                user_id        TEXT,
+                display_name   TEXT NOT NULL,
+                item_id        INTEGER NOT NULL,
+                store_name     TEXT NOT NULL,
+                price          REAL NOT NULL,
+                message        TEXT NOT NULL,
+                created_at     TEXT NOT NULL,
+                FOREIGN KEY (item_id) REFERENCES community_items (id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_community_posts_zip
+                ON community_posts (zip_code, created_at DESC);
             """
         )
         # Lightweight migration for databases created before the plan column.
         columns = [r[1] for r in db.execute("PRAGMA table_info(users)").fetchall()]
         if "plan" not in columns:
             db.execute("ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'")
+        for store, item, price, _, category, _ in STORE_CATALOG:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO community_items
+                    (name, category, reference_price, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (item, category, price, _now_iso()),
+            )
         db.commit()
 
 
@@ -381,6 +414,113 @@ def store_data():
         if regular_price > price
     ]
     return jsonify({"zip": zip_code, "offers": offers, "prices": prices, "deals": deals})
+
+
+@app.route("/community/items", methods=["GET", "POST"])
+def community_items():
+    """List shared items or add one to the community item catalog."""
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        name = str(data.get("name", "")).strip()
+        category = str(data.get("category", "Other")).strip() or "Other"
+        reference_price = data.get("referencePrice")
+        if not name or len(name) > 80:
+            return jsonify({"error": "Item name is required and must be 80 characters or fewer."}), 400
+        try:
+            reference_price = float(reference_price) if reference_price not in (None, "") else None
+            if reference_price is not None and reference_price < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({"error": "referencePrice must be a positive number."}), 400
+        try:
+            cursor = db.execute(
+                "INSERT INTO community_items (name, category, reference_price, created_at) VALUES (?, ?, ?, ?)",
+                (name, category, reference_price, _now_iso()),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            row = db.execute(
+                "SELECT * FROM community_items WHERE name = ? COLLATE NOCASE", (name,)
+            ).fetchone()
+            return jsonify(dict(row)), 200
+        row = db.execute("SELECT * FROM community_items WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return jsonify(dict(row)), 201
+
+    rows = db.execute(
+        "SELECT id, name, category, reference_price, created_at FROM community_items ORDER BY name"
+    ).fetchall()
+    return jsonify([dict(row) for row in rows]), 200
+
+
+@app.route("/community/posts", methods=["GET", "POST"])
+def community_posts():
+    """Read or create price sightings shared with people in one ZIP code."""
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        zip_code = str(data.get("zipCode", "")).strip()
+        display_name = str(data.get("displayName", "Neighbor")).strip() or "Neighbor"
+        user_id = str(data.get("userId", "")).strip() or None
+        store_name = str(data.get("storeName", "")).strip()
+        message = str(data.get("message", "")).strip()
+        try:
+            item_id = int(data.get("itemId"))
+            price = float(data.get("price"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "itemId and price are required."}), 400
+        if not zip_code.isdigit() or len(zip_code) != 5:
+            return jsonify({"error": "A valid 5-digit ZIP code is required."}), 400
+        if not store_name or len(store_name) > 80 or not message or len(message) > 280:
+            return jsonify({"error": "Store and message are required; message limit is 280 characters."}), 400
+        if price < 0 or price > 100000:
+            return jsonify({"error": "Price must be a valid positive amount."}), 400
+        item = db.execute("SELECT id FROM community_items WHERE id = ?", (item_id,)).fetchone()
+        if item is None:
+            return jsonify({"error": "That community item does not exist."}), 404
+        cursor = db.execute(
+            """
+            INSERT INTO community_posts
+                (zip_code, user_id, display_name, item_id, store_name, price, message, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (zip_code, user_id, display_name[:60], item_id, store_name, price, message, _now_iso()),
+        )
+        db.commit()
+        row = db.execute(
+            """
+            SELECT p.id, p.zip_code, p.user_id, p.display_name, p.store_name,
+                   p.price, p.message, p.created_at, i.name AS item_name,
+                   i.category, i.reference_price,
+                   CASE WHEN i.reference_price IS NULL THEN NULL
+                        ELSE ROUND(i.reference_price - p.price, 2) END AS difference
+            FROM community_posts p
+            JOIN community_items i ON i.id = p.item_id
+            WHERE p.id = ?
+            """,
+            (cursor.lastrowid,),
+        ).fetchone()
+        return jsonify(dict(row)), 201
+
+    zip_code = request.args.get("zip", "").strip()
+    if not zip_code.isdigit() or len(zip_code) != 5:
+        return jsonify({"error": "A valid 5-digit ZIP query parameter is required."}), 400
+    rows = db.execute(
+        """
+        SELECT p.id, p.zip_code, p.user_id, p.display_name, p.store_name,
+               p.price, p.message, p.created_at, i.name AS item_name,
+               i.category, i.reference_price,
+               CASE WHEN i.reference_price IS NULL THEN NULL
+                    ELSE ROUND(i.reference_price - p.price, 2) END AS difference
+        FROM community_posts p
+        JOIN community_items i ON i.id = p.item_id
+        WHERE p.zip_code = ?
+        ORDER BY p.created_at DESC
+        LIMIT 100
+        """,
+        (zip_code,),
+    ).fetchall()
+    return jsonify([dict(row) for row in rows]), 200
 
 
 @app.route("/billing/checkout", methods=["POST"])
